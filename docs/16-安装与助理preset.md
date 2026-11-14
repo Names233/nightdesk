@@ -1,6 +1,6 @@
 # 安装与助理 preset
 
-本文说明怎么在本机跑起 NightDesk，以及「助理 preset」怎么接进 dsh。它覆盖当前已实现的部分（D00 / D01 / D02 / D03 / D04 / D05 / D06 / D07 / D08）；D08 受管委派只做单 worker 本地草稿，真机与真实会话验证仍未做。
+本文说明怎么在本机跑起 NightDesk，以及「助理 preset」怎么接进 dsh。它覆盖当前已实现的部分（D00 / D01 / D02 / D03 / D04 / D05 / D06 / D07 / D08）；**D01–D07 已在真实 agent 会话里跑通**（见第 8 节），D08 受管委派只有单测、没有真实会话验证；QQ 通道真机联调仍未做。
 
 ## 1. 运行前提
 
@@ -96,7 +96,7 @@ preset 是 dsh 的「一个 Agent 用哪些子插件」声明。NightDesk 的助
 
 `nightdesk` 业务插件本身仍由 profile 顶层的 `insert` 全局加载，所以提醒调度在任意会话里都在跑；preset 只决定助理会话能看见哪些工具。
 
-## 5. 工具清单（23 个）
+## 5. 工具清单（24 个）
 
 | 工具 | 用途 |
 | --- | --- |
@@ -107,6 +107,7 @@ preset 是 dsh 的「一个 Agent 用哪些子插件」声明。NightDesk 的助
 | `nightdesk_complete` | 标记完成（manual_complete） |
 | `nightdesk_remind` | 手动为一个事项排提醒 |
 | `nightdesk_reminders` | 查提醒与投递状态 |
+| `nightdesk_reminder_cancel` | 取消未发送的提醒（`queued`/`retry`）；已受理或已投递的一律拒绝，不改写已发生的事实 |
 | `nightdesk_tick` | 立刻跑一次调度（调试用） |
 | `nightdesk_channel` | 当前通道种类与是否配置完整（不回显 secret） |
 | `nightdesk_probe_qq` | QQ 通道能力探针（五项能力，可选发一条测试消息） |
@@ -150,3 +151,21 @@ $env:NIGHTDESK_QQBOT_OPENID = '<你的 user_openid>'
 - **会话运行状态**：宿主只读面没有运行态字段，`runState` 恒为 `unknown`。
 - **受管委派（D08）**：已实现单 worker 本地草稿、结构化核对、两轮返工、停止与旧 attempt 拒绝；不真的起子进程或子会话，不做多 worker、远程执行，也不写宿主 dsh 数据库。真机与真实会话验证仍未做。
 - **提醒的时效**：调度器在 dsh 进程里跑，进程不在就不发；重启后只在下次 tick 补发未过期的 `queued/retry`，`submitting` 会保守地记为 `unknown`。
+
+## 8. 用 SDK 协议跑真实会话（自测）
+
+`tools/sdk-chat.mjs` 用 dsh 官方的 stdio JSON-RPC（`@deepseek-ai/dsh-sdk-app`）驱动一个**真实 agent 会话**，用来验证「模型会不会自己调 `nightdesk_*` 工具、效果有没有落库」。它不起 Web、不碰 5593、与桌面版无关。
+
+```powershell
+$env:DSH_HOME = 'C:\Users\Names\.dsh-nightdesk'
+$env:NIGHTDESK_DATA_DIR = 'C:\Users\Names\.dsh-nightdesk\nightdesk-data'
+$env:MAGPIE_GATEWAY_KEY = '<模型网关 key，不要写进任何文件>'
+node tools/sdk-chat.mjs --session nightdesk-demo-3 --new `
+  --prompt-file .cache/prompt-a.md --out .cache/demo.log --shutdown
+```
+
+- `--new`：新会话，跳过 `session/resume`（不写会报 `session "..." not found`）。
+- `--hold 220`：turn 结束后保持运行时存活 N 秒，用来观察**到期提醒真的被投递**；`--hold` 自带 shutdown。
+- 额度：`--timeout` 单轮等待上限，默认 240 秒；多轮就重复写多个 `--prompt/--prompt-file`，同一进程内按顺序发。
+
+已验证的一次完整链路（2026-11-15）：模型 `capture → confirm → remind` 建事项与提醒；取消多余的 `advance` 提醒后 `status=canceled`、`next_attempt_at=null`、写审计；到期后 console 通道在 6 秒内投递，`notifications.status=accepted`、`deliveries` 有对应一行（`channel=console`）。注意 `accepted` 只代表**通道受理**，不等于手机显示。

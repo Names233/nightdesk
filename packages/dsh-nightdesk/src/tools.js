@@ -105,8 +105,19 @@ export function createTools(store, { scheduler, channel, probe, sessionProbe, ov
       '查询提醒的调度、通道受理与设备确认状态，不把通道受理当作已送达。',
       {
         status: { type: 'string', enum: ['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown'] },
+        itemId: { type: 'string', minLength: 1 },
         limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
       }, [], (args) => store.reminders(args),
+    ),
+    definition(
+      'nightdesk_reminder_cancel',
+      '取消尚未提交的提醒；必须提供 notificationId 或 itemId 之一，itemId 可用 kind 限定类型。已受理、已送达或其他不可取消状态会明确拒绝。',
+      {
+        ownerId: { type: 'string', minLength: 1 },
+        notificationId: { type: 'string', minLength: 1 },
+        itemId: { type: 'string', minLength: 1 },
+        kind: { type: 'string', enum: ['due', 'advance', 'manual'] },
+      }, [], (args) => store.cancelReminder(args),
     ),
     definition(
       'nightdesk_tick',

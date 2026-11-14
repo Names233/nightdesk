@@ -9,3 +9,4 @@ import './probe.test.js';
 import './sessions-probe.test.js';
 import './overview.test.js';
 import './delegation.test.js';
+import './reminder-cancel.test.js';

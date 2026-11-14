@@ -550,6 +550,7 @@ export class NightDeskStore {
   reminders(args = {}) {
     requireObject(args);
     optionalString(args, 'status');
+    optionalString(args, 'itemId');
     const status = args.status ?? null;
     const limit = args.limit ?? 50;
     if (status !== null && !REMINDER_STATUSES.has(status)) {
@@ -558,10 +559,12 @@ export class NightDeskStore {
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw error('INVALID_ARGS', 'limit must be an integer from 1 to 100');
     }
+    if (args.itemId !== undefined && args.itemId.length === 0) throw error('INVALID_ARGS', 'itemId must be non-empty');
     const notifications = this.db.prepare(`SELECT * FROM notifications WHERE owner_id = ?
       ${status === null ? '' : 'AND status = ?'}
+      ${args.itemId === undefined ? '' : 'AND item_id = ?'}
       ORDER BY scheduled_at, created_at, id LIMIT ?`)
-      .all(...(status === null ? [this.ownerId, limit] : [this.ownerId, status, limit]));
+      .all(...[this.ownerId, ...(status === null ? [] : [status]), ...(args.itemId === undefined ? [] : [args.itemId]), limit]);
     return {
       notifications: notifications.map((row) => ({
         id: row.id,
@@ -601,6 +604,57 @@ export class NightDeskStore {
       const dueAt = args.dueAt ?? item.due_at;
       if (dueAt === null) throw error('INVALID_ARGS', 'dueAt is required when the item has no instant deadline');
       return this.onReminderRequested(item, utcInstant(dueAt), args.kind ?? 'due');
+    });
+  }
+
+  cancelReminder(args = {}) {
+    requireObject(args);
+    optionalString(args, 'ownerId');
+    optionalString(args, 'notificationId');
+    optionalString(args, 'itemId');
+    optionalString(args, 'kind');
+    const ownerId = args.ownerId ?? this.ownerId;
+    if ((args.notificationId === undefined) === (args.itemId === undefined)) {
+      throw error('INVALID_ARGS', 'exactly one of notificationId or itemId is required');
+    }
+    if (ownerId === '') throw error('INVALID_ARGS', 'ownerId must be non-empty');
+    for (const field of ['notificationId', 'itemId', 'kind']) {
+      if (args[field] !== undefined && args[field].length === 0) throw error('INVALID_ARGS', `${field} must be non-empty`);
+    }
+    if (args.kind !== undefined && !['due', 'advance', 'manual'].includes(args.kind)) {
+      throw error('INVALID_ARGS', 'kind must be due, advance, or manual');
+    }
+    const hasVersion = Boolean(this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get('notifications', 'version'));
+    const at = new Date().toISOString();
+    return this.transaction(() => {
+      const rows = this.db.prepare(`SELECT * FROM notifications WHERE owner_id = ?
+        AND ${args.notificationId !== undefined ? 'id = ?' : 'item_id = ?'}
+        ${args.kind === undefined ? '' : 'AND kind = ?'}`)
+        .all(...[ownerId, args.notificationId ?? args.itemId, ...(args.kind === undefined ? [] : [args.kind])]);
+      if (rows.length === 0) throw error('NOT_FOUND', 'notification not found');
+      const blocked = rows.find((row) => !['queued', 'retry'].includes(row.status));
+      if (blocked) throw error('NOT_CANCELABLE', `notification status is ${blocked.status}`);
+      for (const row of rows) {
+        const changed = this.db.prepare(`UPDATE notifications SET status = 'canceled', next_attempt_at = NULL,
+          canceled_at = ?, cancel_reason = 'user_cancel', updated_at = ?
+          ${hasVersion ? ', version = version + 1' : ''}
+          WHERE id = ? AND owner_id = ? AND status IN ('queued', 'retry')`).run(at, at, row.id, ownerId);
+        if (changed.changes !== 1) {
+          const current = this.db.prepare('SELECT status FROM notifications WHERE id = ? AND owner_id = ?').get(row.id, ownerId);
+          throw error('NOT_CANCELABLE', `notification status is ${current?.status ?? 'unknown'}`);
+        }
+        this.recordAudit('nightdesk.reminder_canceled', row.item_id, at, {
+          notificationId: row.id,
+          kind: row.kind,
+          dueAt: row.due_at,
+          reason: 'user_cancel',
+        });
+      }
+      return {
+        ok: true,
+        canceled: rows.map((row) => ({ id: row.id, itemId: row.item_id, kind: row.kind, dueAt: row.due_at })),
+        count: rows.length,
+      };
     });
   }
 
