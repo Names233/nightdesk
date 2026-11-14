@@ -1,0 +1,430 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE } from './dates.js';
+
+export const SCHEMA_VERSION = 1;
+const COMPLETIONS = new Set(['manual_complete', 'source_complete', 'conflicted']);
+
+function error(code, message) {
+  return new Error(`${code} ${message}`);
+}
+
+function requireObject(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw error('INVALID_ARGS', 'arguments must be an object');
+  }
+}
+
+function requiredString(args, field) {
+  if (typeof args[field] !== 'string' || args[field].length === 0) {
+    throw error('INVALID_ARGS', `${field} must be a non-empty string`);
+  }
+}
+
+function optionalString(args, field) {
+  if (args[field] !== undefined && typeof args[field] !== 'string') {
+    throw error('INVALID_ARGS', `${field} must be a string`);
+  }
+}
+
+function requiredVersion(args) {
+  if (!Number.isInteger(args.expectedVersion) || args.expectedVersion < 1) {
+    throw error('INVALID_ARGS', 'expectedVersion must be a positive integer');
+  }
+}
+
+function hash(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function toItem(row) {
+  if (!row) return null;
+  return {
+    itemId: row.id,
+    observationId: row.observation_id,
+    title: row.title,
+    dueDate: row.due_date,
+    dueAt: row.due_at,
+    timeZone: row.time_zone,
+    precision: row.precision,
+    timeStatus: row.time_status,
+    completion: row.completion,
+    confirmed: Boolean(row.confirmed),
+    needsConfirmation: !row.confirmed,
+    version: row.version,
+    matchedText: row.matched_text ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function splitSegments(text) {
+  const segments = text.split(/[\r\n。！？!?；;]+/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return segments.length > 0 ? segments : [text];
+}
+
+export class NightDeskStore {
+  constructor(options = {}) {
+    this.dataDir = options.dataDir ?? process.env.NIGHTDESK_DATA_DIR ?? join(homedir(), '.dsh', 'nightdesk-data');
+    this.dbPath = join(this.dataDir, 'nightdesk.db');
+    this.ownerId = options.ownerId ?? process.env.NIGHTDESK_OWNER ?? 'local';
+    this.closed = false;
+    mkdirSync(this.dataDir, { recursive: true });
+    this.db = new DatabaseSync(this.dbPath);
+    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    this.migrate();
+  }
+
+  migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+      INSERT INTO meta(key, value) VALUES ('schema_version', '1')
+        ON CONFLICT(key) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS observations (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT,
+        source_id TEXT,
+        source_label TEXT,
+        raw_text TEXT,
+        content_hash TEXT,
+        occurred_at TEXT,
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS items (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT,
+        observation_id TEXT,
+        title TEXT,
+        due_at TEXT,
+        due_date TEXT,
+        time_zone TEXT,
+        precision TEXT,
+        time_status TEXT,
+        completion TEXT,
+        confirmed INTEGER,
+        version INTEGER,
+        created_at TEXT,
+        updated_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS item_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id TEXT,
+        version INTEGER,
+        snapshot_json TEXT,
+        changed_at TEXT,
+        reason TEXT
+      );
+      CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY,
+        event_id TEXT,
+        handler_id TEXT,
+        type TEXT,
+        payload_json TEXT,
+        status TEXT,
+        attempts INTEGER,
+        available_at TEXT,
+        created_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_handler
+        ON outbox(event_id, handler_id);
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id TEXT PRIMARY KEY,
+        at TEXT,
+        actor TEXT,
+        action TEXT,
+        item_id TEXT,
+        detail_json TEXT
+      );
+      CREATE TABLE IF NOT EXISTS idempotency (
+        key TEXT PRIMARY KEY,
+        scope TEXT,
+        request_hash TEXT,
+        response_json TEXT,
+        created_at TEXT
+      );
+    `);
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
+    if (Number(row.value) !== SCHEMA_VERSION) {
+      throw error('INVALID_ARGS', `schema_version unsupported: ${row.value}`);
+    }
+  }
+
+  close() {
+    if (!this.closed) {
+      this.db.close();
+      this.closed = true;
+    }
+  }
+
+  transaction(callback) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const value = callback();
+      this.db.exec('COMMIT');
+      return value;
+    } catch (cause) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Preserve the original business error if rollback itself fails.
+      }
+      throw cause;
+    }
+  }
+
+  health() {
+    return {
+      ok: true,
+      pluginVersion: '0.1.0',
+      schemaVersion: SCHEMA_VERSION,
+      dataDir: this.dataDir,
+      dbPath: this.dbPath,
+      timeZone: TIME_ZONE,
+      nowUtc: new Date().toISOString(),
+      counts: {
+        observations: this.db.prepare('SELECT COUNT(*) AS count FROM observations WHERE owner_id = ?').get(this.ownerId).count,
+        items: this.db.prepare('SELECT COUNT(*) AS count FROM items WHERE owner_id = ?').get(this.ownerId).count,
+        outboxPending: this.db.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status = 'pending'").get().count,
+      },
+      readOnly: false,
+    };
+  }
+
+  capture(args) {
+    requireObject(args);
+    requiredString(args, 'text');
+    optionalString(args, 'sourceLabel');
+    optionalString(args, 'sourceId');
+    optionalString(args, 'occurredAt');
+    optionalString(args, 'idempotencyKey');
+    if (args.occurredAt !== undefined && (typeof args.occurredAt !== 'string'
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(args.occurredAt)
+      || Number.isNaN(new Date(args.occurredAt).getTime()))) {
+      throw error('INVALID_ARGS', 'occurredAt must be RFC3339');
+    }
+    const requestHash = hash(canonical({ ...args, idempotencyKey: undefined }));
+    if (args.idempotencyKey) {
+      const replay = this.db.prepare('SELECT request_hash, response_json FROM idempotency WHERE key = ? AND scope = ?')
+        .get(args.idempotencyKey, `capture:${this.ownerId}`);
+      if (replay) {
+        if (replay.request_hash !== requestHash) {
+          throw error('IDEMPOTENCY_CONFLICT', 'idempotencyKey was used with a different body');
+        }
+        return JSON.parse(replay.response_json);
+      }
+    }
+    return this.transaction(() => {
+      if (args.idempotencyKey) {
+        const replay = this.db.prepare('SELECT request_hash, response_json FROM idempotency WHERE key = ? AND scope = ?')
+          .get(args.idempotencyKey, `capture:${this.ownerId}`);
+        if (replay) {
+          if (replay.request_hash !== requestHash) throw error('IDEMPOTENCY_CONFLICT', 'idempotencyKey was used with a different body');
+          return JSON.parse(replay.response_json);
+        }
+      }
+      const createdAt = new Date().toISOString();
+      const observationId = randomUUID();
+      this.db.prepare(`INSERT INTO observations
+        (id, owner_id, source_id, source_label, raw_text, content_hash, occurred_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        observationId,
+        this.ownerId,
+        args.sourceId ?? null,
+        args.sourceLabel ?? 'manual',
+        args.text,
+        hash(args.text),
+        args.occurredAt ? new Date(args.occurredAt).toISOString() : createdAt,
+        createdAt,
+      );
+      const candidates = splitSegments(args.text).map((title) => {
+        const deadline = extractDeadline(title, createdAt);
+        const itemId = randomUUID();
+        const item = {
+          id: itemId,
+          owner_id: this.ownerId,
+          observation_id: observationId,
+          title,
+          due_at: null,
+          due_date: deadline.dueDate,
+          time_zone: TIME_ZONE,
+          precision: deadline.precision,
+          time_status: deadline.timeStatus,
+          completion: 'unconfirmed',
+          confirmed: 0,
+          version: 1,
+          matched_text: deadline.matchedText,
+          created_at: createdAt,
+          updated_at: createdAt,
+        };
+        this.insertItem(item, createdAt, 'capture');
+        return {
+          itemId,
+          title,
+          dueDate: deadline.dueDate,
+          dueAt: deadline.dueAt,
+          timeStatus: deadline.timeStatus,
+          precision: deadline.precision,
+          matchedText: deadline.matchedText,
+          needsConfirmation: true,
+          version: 1,
+        };
+      });
+      const response = {
+        observationId,
+        candidates,
+        totals: { observations: 1, candidates: candidates.length },
+      };
+      if (args.idempotencyKey) {
+        this.db.prepare('INSERT INTO idempotency(key, scope, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?)')
+          .run(args.idempotencyKey, `capture:${this.ownerId}`, requestHash, JSON.stringify(response), createdAt);
+      }
+      return response;
+    });
+  }
+
+  insertItem(item, at, reason) {
+    this.db.prepare(`INSERT INTO items
+      (id, owner_id, observation_id, title, due_at, due_date, time_zone, precision,
+       time_status, completion, confirmed, version, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      item.id, item.owner_id, item.observation_id, item.title, item.due_at, item.due_date,
+      item.time_zone, item.precision, item.time_status, item.completion, item.confirmed,
+      item.version, item.created_at, item.updated_at,
+    );
+    // matchedText is response metadata, kept in version snapshots rather than changing the specified table.
+    this.appendVersion(item, at, reason);
+  }
+
+  appendVersion(item, at, reason) {
+    this.db.prepare('INSERT INTO item_versions(item_id, version, snapshot_json, changed_at, reason) VALUES (?, ?, ?, ?, ?)')
+      .run(item.id, item.version, JSON.stringify(item), at, reason);
+  }
+
+  items(args = {}) {
+    requireObject(args);
+    const view = args.view ?? 'today';
+    const includeUnconfirmed = args.includeUnconfirmed ?? true;
+    const limit = args.limit ?? 50;
+    if (!['today', 'pending', 'all'].includes(view)) throw error('INVALID_ARGS', 'view must be today, pending, or all');
+    if (typeof includeUnconfirmed !== 'boolean') throw error('INVALID_ARGS', 'includeUnconfirmed must be a boolean');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw error('INVALID_ARGS', 'limit must be an integer from 1 to 100');
+    const asOfUtc = new Date().toISOString();
+    const today = shanghaiDate(asOfUtc);
+    const clauses = ['owner_id = ?'];
+    const params = [this.ownerId];
+    if (view === 'today') {
+      clauses.push('(due_date = ? OR substr(due_at, 1, 10) = ?)');
+      params.push(today, today);
+    }
+    if (view === 'pending') clauses.push("completion = 'unconfirmed'");
+    if (!includeUnconfirmed) clauses.push('confirmed = 1');
+    const where = clauses.join(' AND ');
+    const items = this.db.prepare(`SELECT * FROM items WHERE ${where} ORDER BY due_date IS NULL, due_date, created_at`)
+      .all(...params).filter((row) => view !== 'today' || row.due_date === today || isShanghaiDate(row.due_at, today))
+      .slice(0, limit).map(toItem);
+    return {
+      view,
+      asOfUtc,
+      readScope: { timeZone: TIME_ZONE, limit },
+      items,
+      counts: { returned: items.length, today: this.db.prepare('SELECT * FROM items WHERE owner_id = ? AND (due_date = ? OR due_at IS NOT NULL)')
+        .all(this.ownerId, today).filter((row) => row.due_date === today || isShanghaiDate(row.due_at, today)).length },
+    };
+  }
+
+  ownedItem(itemId) {
+    return this.db.prepare('SELECT * FROM items WHERE id = ? AND owner_id = ?').get(itemId, this.ownerId);
+  }
+
+  confirm(args) {
+    requireObject(args);
+    requiredString(args, 'itemId');
+    requiredVersion(args);
+    for (const field of ['dueDate', 'dueAt', 'title']) optionalString(args, field);
+    if (args.timeStatus !== undefined && !['resolved', 'unknown', 'ambiguous'].includes(args.timeStatus)) {
+      throw error('INVALID_ARGS', 'timeStatus must be resolved, unknown, or ambiguous');
+    }
+    if (args.dueDate !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(args.dueDate)
+      || shanghaiDate(`${args.dueDate}T00:00:00+08:00`) !== args.dueDate)) {
+      throw error('INVALID_ARGS', 'dueDate must be a valid YYYY-MM-DD');
+    }
+    if (args.dueAt !== undefined && Number.isNaN(new Date(args.dueAt).getTime())) {
+      throw error('INVALID_ARGS', 'dueAt must be RFC3339');
+    }
+    if (args.title !== undefined && args.title.length === 0) throw error('INVALID_ARGS', 'title must be non-empty');
+    const current = this.ownedItem(args.itemId);
+    if (!current || current.version !== args.expectedVersion) {
+      throw error('VERSION_CONFLICT', `itemId ${args.itemId}; currentVersion ${current?.version ?? 'not-found'}`);
+    }
+    const at = new Date().toISOString();
+    const dueAt = args.dueAt === undefined ? current.due_at : new Date(args.dueAt).toISOString();
+    const dueDate = args.dueDate ?? (args.dueAt !== undefined ? shanghaiDate(dueAt) : current.due_date);
+    const timeStatus = args.timeStatus ?? current.time_status;
+    const precision = args.dueAt !== undefined ? 'instant' : args.dueDate !== undefined ? 'day' : current.precision;
+    return this.transaction(() => {
+      const changed = this.db.prepare(`UPDATE items SET title = ?, due_at = ?, due_date = ?, precision = ?,
+        time_status = ?, confirmed = 1, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND owner_id = ?`)
+        .run(args.title ?? current.title, dueAt, dueDate, precision, timeStatus, at, args.itemId, args.expectedVersion, this.ownerId);
+      if (changed.changes !== 1) {
+        const latest = this.ownedItem(args.itemId);
+        throw error('VERSION_CONFLICT', `itemId ${args.itemId}; currentVersion ${latest?.version ?? 'not-found'}`);
+      }
+      const updated = this.ownedItem(args.itemId);
+      this.appendVersion(updated, at, 'confirm');
+      this.recordEvent('nightdesk.confirm', 'item.confirmed', updated, at);
+      return toItem(updated);
+    });
+  }
+
+  complete(args) {
+    requireObject(args);
+    requiredString(args, 'itemId');
+    requiredVersion(args);
+    const completion = args.completion ?? 'manual_complete';
+    if (!COMPLETIONS.has(completion)) throw error('INVALID_ARGS', 'completion is not a supported completion state');
+    const current = this.ownedItem(args.itemId);
+    if (!current || current.version !== args.expectedVersion) {
+      throw error('VERSION_CONFLICT', `itemId ${args.itemId}; currentVersion ${current?.version ?? 'not-found'}`);
+    }
+    if (current.time_status === 'canceled') throw error('INVALID_ARGS', 'itemId is canceled and cannot be completed');
+    const at = new Date().toISOString();
+    return this.transaction(() => {
+      const changed = this.db.prepare(`UPDATE items SET completion = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND owner_id = ?`).run(completion, at, args.itemId, args.expectedVersion, this.ownerId);
+      if (changed.changes !== 1) {
+        const latest = this.ownedItem(args.itemId);
+        throw error('VERSION_CONFLICT', `itemId ${args.itemId}; currentVersion ${latest?.version ?? 'not-found'}`);
+      }
+      const updated = this.ownedItem(args.itemId);
+      this.appendVersion(updated, at, 'complete');
+      this.recordEvent('nightdesk.complete', 'item.completed', updated, at);
+      return toItem(updated);
+    });
+  }
+
+  recordEvent(action, type, item, at) {
+    this.db.prepare('INSERT INTO audit_events(id, at, actor, action, item_id, detail_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), at, this.ownerId, action, item.id, JSON.stringify({ version: item.version }));
+    const eventId = randomUUID();
+    this.db.prepare(`INSERT INTO outbox(id, event_id, handler_id, type, payload_json, status, attempts, available_at, created_at)
+      VALUES (?, ?, NULL, ?, ?, 'pending', 0, ?, ?)`).run(
+      randomUUID(), eventId, type, JSON.stringify({ itemId: item.id, version: item.version }), at, at,
+    );
+  }
+}

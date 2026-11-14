@@ -1,0 +1,3 @@
+- insert:
+    - id: nightdesk
+      name: '@nightdesk/dsh-nightdesk'

@@ -1,0 +1,11 @@
+{
+  "name": "@nightdesk/dsh-nightdesk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NightDesk dsh business plugin: observations, deadlines, confirmations.",
+  "exports": { ".": "./src/index.js" },
+  "files": ["src", "cordis.patch.yml"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": { "test": "node --test test" }
+}
