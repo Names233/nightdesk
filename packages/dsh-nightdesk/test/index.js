@@ -6,3 +6,4 @@ import './scheduler.test.js';
 import './channel.test.js';
 import './outbox.test.js';
 import './probe.test.js';
+import './sessions-probe.test.js';

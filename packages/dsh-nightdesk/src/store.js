@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE, utcInstant } from './dates.js';
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 const COMPLETIONS = new Set(['manual_complete', 'source_complete', 'conflicted']);
 const REMINDER_STATUSES = new Set(['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown']);
 
@@ -112,6 +112,25 @@ function toProbe(row) {
   };
 }
 
+function toWatchedSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+    sessionId: row.session_id,
+    label: row.label,
+    addedAt: row.added_at,
+    lastReadAt: row.last_read_at,
+    lastSeq: row.last_seq,
+    lastEventAt: row.last_event_at,
+    lastEventType: row.last_event_type,
+    status: row.status,
+    error: row.error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function splitSegments(text) {
   const segments = text.split(/[\r\n。！？!?；;]+/u)
     .map((part) => part.trim())
@@ -140,7 +159,7 @@ export class NightDeskStore {
     this.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()) {
         const version = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
-        if (version !== undefined && !['1', '2', '3'].includes(version)) {
+        if (version !== undefined && !['1', '2', '3', '4'].includes(version)) {
           throw error('INVALID_ARGS', `schema_version unsupported: ${version}`);
         }
       }
@@ -260,7 +279,15 @@ export class NightDeskStore {
       );
       CREATE INDEX IF NOT EXISTS probes_owner_kind_started
         ON probes(owner_id, kind, started_at DESC);
-      UPDATE meta SET value = '3' WHERE key = 'schema_version' AND value IN ('1', '2', '3');
+      CREATE TABLE IF NOT EXISTS watched_sessions (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, session_id TEXT NOT NULL,
+        label TEXT, added_at TEXT NOT NULL, last_read_at TEXT, last_seq INTEGER,
+        last_event_at TEXT, last_event_type TEXT,
+        status TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS watched_sessions_unique
+        ON watched_sessions(owner_id, session_id);
+      UPDATE meta SET value = '4' WHERE key = 'schema_version' AND value IN ('1', '2', '3', '4');
     `);
     const migrationAt = new Date().toISOString();
     const legacyItems = this.db.prepare(`SELECT i.* FROM items i
@@ -704,5 +731,78 @@ export class NightDeskStore {
     this.db.prepare(`UPDATE channel_bindings SET last_verified_at = ?, last_error = NULL,
       updated_at = ? WHERE id = ? AND owner_id = ?`).run(at, at, id, this.ownerId);
     return toBinding(this.db.prepare('SELECT * FROM channel_bindings WHERE id = ? AND owner_id = ?').get(id, this.ownerId));
+  }
+
+  watchSession(args = {}) {
+    requireObject(args);
+    const ownerId = args.ownerId ?? this.ownerId;
+    requiredString({ ownerId }, 'ownerId');
+    requiredString(args, 'sessionId');
+    optionalString(args, 'label');
+    const at = args.at ?? new Date().toISOString();
+    requiredString({ at }, 'at');
+    this.db.prepare(`INSERT INTO watched_sessions
+      (id, owner_id, session_id, label, added_at, last_read_at, last_seq,
+       last_event_at, last_event_type, status, error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+      ON CONFLICT(owner_id, session_id) DO UPDATE SET
+        label = excluded.label, updated_at = excluded.updated_at`).run(
+      randomUUID(), ownerId, args.sessionId, args.label ?? null, at, at, at,
+    );
+    return toWatchedSession(this.db.prepare(`SELECT * FROM watched_sessions
+      WHERE owner_id = ? AND session_id = ?`).get(ownerId, args.sessionId));
+  }
+
+  unwatchSession(args = {}) {
+    requireObject(args);
+    const ownerId = args.ownerId ?? this.ownerId;
+    requiredString({ ownerId }, 'ownerId');
+    requiredString(args, 'sessionId');
+    const result = this.db.prepare('DELETE FROM watched_sessions WHERE owner_id = ? AND session_id = ?')
+      .run(ownerId, args.sessionId);
+    return { removed: result.changes === 1 };
+  }
+
+  listWatchedSessions(args = {}) {
+    requireObject(args);
+    const ownerId = args.ownerId ?? this.ownerId;
+    requiredString({ ownerId }, 'ownerId');
+    return this.db.prepare(`SELECT * FROM watched_sessions WHERE owner_id = ?
+      ORDER BY added_at, created_at, id`).all(ownerId).map(toWatchedSession);
+  }
+
+  updateWatchedSession(args = {}) {
+    requireObject(args);
+    const ownerId = args.ownerId ?? this.ownerId;
+    requiredString({ ownerId }, 'ownerId');
+    requiredString(args, 'sessionId');
+    requiredString(args, 'lastReadAt');
+    if (args.lastSeq !== null && args.lastSeq !== undefined && !Number.isInteger(args.lastSeq)) {
+      throw error('INVALID_ARGS', 'lastSeq must be an integer or null');
+    }
+    for (const field of ['lastEventAt', 'lastEventType', 'status', 'error']) {
+      if (args[field] !== undefined && args[field] !== null && typeof args[field] !== 'string') {
+        throw error('INVALID_ARGS', `${field} must be a string or null`);
+      }
+    }
+    const updatedAt = args.updatedAt ?? args.lastReadAt;
+    requiredString({ updatedAt }, 'updatedAt');
+    const changed = this.db.prepare(`UPDATE watched_sessions SET
+      last_read_at = ?, last_seq = ?, last_event_at = ?, last_event_type = ?,
+      status = ?, error = ?, updated_at = ?
+      WHERE owner_id = ? AND session_id = ?`).run(
+      args.lastReadAt,
+      args.lastSeq ?? null,
+      args.lastEventAt ?? null,
+      args.lastEventType ?? null,
+      args.status ?? null,
+      args.error ?? null,
+      updatedAt,
+      ownerId,
+      args.sessionId,
+    );
+    if (changed.changes !== 1) return null;
+    return toWatchedSession(this.db.prepare(`SELECT * FROM watched_sessions
+      WHERE owner_id = ? AND session_id = ?`).get(ownerId, args.sessionId));
   }
 }

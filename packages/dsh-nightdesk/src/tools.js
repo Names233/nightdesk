@@ -31,7 +31,7 @@ function publicBinding(record) {
   return { ...rest, openid: externalId };
 }
 
-export function createTools(store, { scheduler, channel, probe, channelConfig } = {}) {
+export function createTools(store, { scheduler, channel, probe, sessionProbe, channelConfig } = {}) {
   return [
     definition(
       'nightdesk_health',
@@ -156,6 +156,47 @@ export function createTools(store, { scheduler, channel, probe, channelConfig } 
           externalId: args.openid,
           displayName: args.displayName,
         }));
+      },
+    ),
+    definition(
+      'nightdesk_session_watch',
+      '把一个 dsh 会话加入只读观察名单；不会控制、恢复或修改该会话。',
+      {
+        sessionId: { type: 'string', minLength: 1 },
+        label: { type: 'string' },
+      }, ['sessionId'], (args) => {
+        requireObjectArgs(args);
+        if (!sessionProbe) return { available: false, reason: 'session-probe-unavailable' };
+        return sessionProbe.watch({ ownerId: store.ownerId, sessionId: args.sessionId, label: args.label });
+      },
+    ),
+    definition(
+      'nightdesk_session_unwatch',
+      '从只读观察名单移除一个 dsh 会话；不会控制该会话。',
+      {
+        sessionId: { type: 'string', minLength: 1 },
+      }, ['sessionId'], (args) => {
+        requireObjectArgs(args);
+        if (!sessionProbe) return { available: false, reason: 'session-probe-unavailable' };
+        return sessionProbe.unwatch({ ownerId: store.ownerId, sessionId: args.sessionId });
+      },
+    ),
+    definition(
+      'nightdesk_sessions',
+      '查询只读会话观察名单；refresh=true 时读取一次宿主快照，不声称运行或审批状态。',
+      {
+        refresh: { type: 'boolean', default: false },
+      }, [], (args) => {
+        requireObjectArgs(args);
+        requireBoolean(args, 'refresh');
+        if (!sessionProbe || (typeof sessionProbe.isAvailable === 'function' && !sessionProbe.isAvailable())) {
+          return { available: false, reason: 'sessionQuery-unavailable' };
+        }
+        const refresh = args.refresh ?? false;
+        const sessions = refresh
+          ? sessionProbe.refresh({ ownerId: store.ownerId })
+          : sessionProbe.list({ ownerId: store.ownerId });
+        return { available: true, sessions, count: sessions.length };
       },
     ),
   ];
