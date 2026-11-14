@@ -26,7 +26,7 @@ function loadPlugin(t, options = {}) {
   return { registry, getCleanup: () => cleanup };
 }
 
-test('plugin exports contract and registers all nine tools', (t) => {
+test('plugin exports contract and registers all thirteen tools', (t) => {
   const { registry, getCleanup } = loadPlugin(t);
   assert.equal(plugin.name, 'nightdesk');
   assert.deepEqual(plugin.inject, ['tools']);
@@ -34,6 +34,7 @@ test('plugin exports contract and registers all nine tools', (t) => {
   assert.deepEqual([...registry.keys()], [
     'nightdesk_health', 'nightdesk_capture', 'nightdesk_items', 'nightdesk_confirm', 'nightdesk_complete',
     'nightdesk_remind', 'nightdesk_reminders', 'nightdesk_tick', 'nightdesk_channel',
+    'nightdesk_probe_qq', 'nightdesk_probes', 'nightdesk_channels', 'nightdesk_bind_channel',
   ]);
   for (const definition of registry.values()) {
     assert.equal(definition.parameters.type, 'object');
@@ -50,7 +51,7 @@ test('health and capture return lossless JSON values without auto-confirming', a
   const health = await registry.get('nightdesk_health').execute({}, {});
   assert.equal(health.ok, true);
   assert.equal(health.pluginVersion, '0.1.0');
-  assert.equal(health.schemaVersion, 2);
+  assert.equal(health.schemaVersion, 3);
   assert.equal(health.timeZone, 'Asia/Shanghai');
   assert.equal(health.readOnly, false);
   assert.match(health.nowUtc, /Z$/);
@@ -102,6 +103,28 @@ test('reminder tools schedule, list, tick and hide channel credentials', async (
   assert.equal(listed.notifications.every((row) => row.deliveredAt === null), true);
   const tick = await registry.get('nightdesk_tick').execute({}, {});
   assert.deepEqual(tick, { processed: 0, accepted: 0, retry: 0, failed: 0 });
+});
+
+test('QQ binding, probe and history tools enforce masking and persistence', async (t) => {
+  const { registry } = loadPlugin(t);
+  const bound = await registry.get('nightdesk_bind_channel').execute({
+    channel: 'qq', appId: 'public-app', openid: 'openid-12345678', displayName: 'phone',
+  }, {});
+  assert.equal(bound.channel, 'qq');
+  assert.equal(bound.openid, 'ope***5678');
+  assert.equal(JSON.stringify(bound).includes('openid-12345678'), false);
+  const channels = await registry.get('nightdesk_channels').execute({}, {});
+  assert.equal(channels.count, 1);
+  assert.equal(channels.channels[0].openid, 'ope***5678');
+  assert.equal(channels.channels[0].lastVerifiedAt, null);
+  const probe = await registry.get('nightdesk_probe_qq').execute({}, {});
+  assert.equal(probe.status, 'fail');
+  assert.equal(probe.capabilities.length, 5);
+  assert.equal(JSON.stringify(probe).includes('clientSecret'), false);
+  assert.equal(JSON.stringify(probe).includes('access_token'), false);
+  const history = await registry.get('nightdesk_probes').execute({ kind: 'qq', limit: 10 }, {});
+  assert.equal(history.count, 1);
+  assert.equal(history.probes[0].id, probe.id);
 });
 
 test('plugin teardown stops timers without starting a new delivery tick', async (t) => {

@@ -1,5 +1,6 @@
 import { createChannel, channelHealth, loadChannelConfig } from './channel.js';
 import { consumeOutbox } from './outbox.js';
+import { createQqProbe } from './probe.js';
 import { createScheduler } from './scheduler.js';
 import { NightDeskStore } from './store.js';
 import { createTools } from './tools.js';
@@ -30,7 +31,17 @@ export function apply(ctx, deps = {}) {
   try {
     store = new NightDeskStore();
     const channelConfig = loadChannelConfig(store.dataDir);
-    const channel = createChannel(channelConfig, { fetch: deps.fetch, log: deps.log ?? ((text) => console.log(text)) });
+    let channel;
+    try {
+      channel = createChannel(channelConfig, { fetch: deps.fetch, log: deps.log ?? ((text) => console.log(text)) });
+    } catch (cause) {
+      if (channelConfig.kind !== 'qqbot') throw cause;
+      channel = {
+        name: 'qqbot',
+        async send() { return { ok: false, errorDetail: 'QQ channel is not configured' }; },
+      };
+    }
+    const probe = createQqProbe({ store, fetch: deps.fetch, now: deps.now, config: channelConfig });
     scheduler = createScheduler({ store, channel });
     store.onItemChanged = (item, dueAt, kind) => applyItemChange(scheduler, {
       ...item,
@@ -52,7 +63,12 @@ export function apply(ctx, deps = {}) {
     };
     outboxTimer = setInterval(() => { void consume(); }, 30_000);
     scheduler.start();
-    for (const tool of createTools(store, { scheduler, channel, channelConfig: channelHealth(channelConfig) })) {
+    for (const tool of createTools(store, {
+      scheduler,
+      channel,
+      probe,
+      channelConfig: channelHealth(channelConfig),
+    })) {
       ctx.tools.register(tool);
     }
     ctx.effect(() => async () => {

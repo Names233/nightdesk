@@ -15,7 +15,23 @@ function definition(name, description, properties, required, execute) {
   };
 }
 
-export function createTools(store, { scheduler, channel, channelConfig } = {}) {
+function requireObjectArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('INVALID_ARGS arguments must be an object');
+}
+
+function requireBoolean(args, field) {
+  if (args[field] !== undefined && typeof args[field] !== 'boolean') {
+    throw new Error(`INVALID_ARGS ${field} must be a boolean`);
+  }
+}
+
+function publicBinding(record) {
+  if (!record) return null;
+  const { externalId, ...rest } = record;
+  return { ...rest, openid: externalId };
+}
+
+export function createTools(store, { scheduler, channel, probe, channelConfig } = {}) {
   return [
     definition(
       'nightdesk_health',
@@ -92,6 +108,55 @@ export function createTools(store, { scheduler, channel, channelConfig } = {}) {
         name: channel.name,
         configured: channelConfig.configured,
       }),
+    ),
+    definition(
+      'nightdesk_probe_qq',
+      '记录 QQ 官方通道能力探针；默认只换取凭据并核对绑定，sendTest=true 才发送明确标注的测试消息。',
+      { sendTest: { type: 'boolean', default: false } }, [], (args) => {
+        requireObjectArgs(args);
+        requireBoolean(args, 'sendTest');
+        if (!probe || typeof probe.run !== 'function') throw new Error('INVALID_ARGS QQ probe is unavailable');
+        return probe.run({ sendTest: args.sendTest ?? false });
+      },
+    ),
+    definition(
+      'nightdesk_probes',
+      '查询已经持久化的 QQ 通道探针记录，不返回凭据或令牌。',
+      {
+        kind: { type: 'string', minLength: 1 },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+      }, [], (args) => {
+        requireObjectArgs(args);
+        const probes = store.listProbes(args);
+        return { probes, count: probes.length };
+      },
+    ),
+    definition(
+      'nightdesk_channels',
+      '查询通道绑定概览；openid 只显示掩码，绝不返回凭据或完整外部身份。',
+      {}, [], () => {
+        const channels = store.channelBindings().map(publicBinding);
+        return { channels, count: channels.length };
+      },
+    ),
+    definition(
+      'nightdesk_bind_channel',
+      '建立 QQ 私聊 openid 与本地身份的绑定；返回值只包含掩码后的 openid。',
+      {
+        channel: { type: 'string', const: 'qq' },
+        appId: { type: 'string', minLength: 1 },
+        openid: { type: 'string', minLength: 1 },
+        displayName: { type: 'string' },
+      }, ['channel', 'appId', 'openid'], (args) => {
+        requireObjectArgs(args);
+        if (args.channel !== 'qq') throw new Error('INVALID_ARGS channel must be qq');
+        return publicBinding(store.bindChannel({
+          channel: args.channel,
+          appId: args.appId,
+          externalId: args.openid,
+          displayName: args.displayName,
+        }));
+      },
     ),
   ];
 }

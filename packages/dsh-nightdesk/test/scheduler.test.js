@@ -36,7 +36,7 @@ function notification(store) {
 
 test('D06 migration creates notification, delivery and consumer cursor tables', (t) => {
   const { store } = fixture(t);
-  assert.equal(store.health().schemaVersion, 2);
+  assert.equal(store.health().schemaVersion, 3);
   for (const table of ['notifications', 'deliveries', 'outbox_event_handler']) {
     assert.equal(store.db.prepare("SELECT type FROM sqlite_master WHERE name = ?").get(table).type, 'table');
   }

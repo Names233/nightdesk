@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE, utcInstant } from './dates.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 const COMPLETIONS = new Set(['manual_complete', 'source_complete', 'conflicted']);
 const REMINDER_STATUSES = new Set(['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown']);
 
@@ -70,6 +70,48 @@ function toItem(row) {
   };
 }
 
+function maskExternalId(value) {
+  const text = String(value ?? '');
+  if (text.length <= 7) return `${text.slice(0, 3)}***`;
+  return `${text.slice(0, 3)}***${text.slice(-4)}`;
+}
+
+function toBinding(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+    channel: row.channel,
+    appId: row.app_id,
+    externalId: maskExternalId(row.external_id),
+    displayName: row.display_name,
+    boundAt: row.bound_at,
+    lastVerifiedAt: row.last_verified_at,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toProbe(row) {
+  if (!row) return null;
+  let capabilities = [];
+  try { capabilities = JSON.parse(row.capabilities); } catch { capabilities = []; }
+  return {
+    id: row.id,
+    ownerId: row.owner_id,
+    kind: row.kind,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    status: row.status,
+    capabilities,
+    hostVersion: row.host_version,
+    pluginVersion: row.plugin_version,
+    notes: row.notes,
+    createdAt: row.created_at,
+  };
+}
+
 function splitSegments(text) {
   const segments = text.split(/[\r\n。！？!?；;]+/u)
     .map((part) => part.trim())
@@ -98,7 +140,7 @@ export class NightDeskStore {
     this.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()) {
         const version = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
-        if (version !== undefined && !['1', '2'].includes(version)) {
+        if (version !== undefined && !['1', '2', '3'].includes(version)) {
           throw error('INVALID_ARGS', `schema_version unsupported: ${version}`);
         }
       }
@@ -200,7 +242,25 @@ export class NightDeskStore {
         processed_at TEXT NOT NULL,
         PRIMARY KEY(event_id, handler_id)
       );
-      UPDATE meta SET value = '2' WHERE key = 'schema_version' AND value IN ('1', '2');
+      CREATE TABLE IF NOT EXISTS channel_bindings (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, channel TEXT NOT NULL,
+        app_id TEXT, external_id TEXT NOT NULL, display_name TEXT,
+        bound_at TEXT NOT NULL, last_verified_at TEXT, last_error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS channel_bindings_unique
+        ON channel_bindings(owner_id, channel, app_id, external_id);
+      CREATE TABLE IF NOT EXISTS probes (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, kind TEXT NOT NULL,
+        started_at TEXT NOT NULL, finished_at TEXT,
+        status TEXT NOT NULL,
+        capabilities TEXT NOT NULL,
+        host_version TEXT, plugin_version TEXT,
+        notes TEXT, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS probes_owner_kind_started
+        ON probes(owner_id, kind, started_at DESC);
+      UPDATE meta SET value = '3' WHERE key = 'schema_version' AND value IN ('1', '2', '3');
     `);
     const migrationAt = new Date().toISOString();
     const legacyItems = this.db.prepare(`SELECT i.* FROM items i
@@ -544,5 +604,105 @@ export class NightDeskStore {
       VALUES (?, ?, NULL, ?, ?, 'pending', 0, ?, ?)`).run(
       randomUUID(), eventId, type, JSON.stringify({ itemId: item.id, version: item.version }), at, at,
     );
+  }
+
+  recordProbe(record) {
+    requireObject(record);
+    requiredString(record, 'kind');
+    requiredString(record, 'startedAt');
+    requiredString(record, 'status');
+    if (!['pass', 'partial', 'fail'].includes(record.status)) throw error('INVALID_ARGS', 'probe status is unsupported');
+    if (!Array.isArray(record.capabilities)) throw error('INVALID_ARGS', 'probe capabilities must be an array');
+    const createdAt = record.createdAt ?? new Date().toISOString();
+    const row = {
+      id: record.id ?? randomUUID(),
+      ownerId: this.ownerId,
+      kind: record.kind,
+      startedAt: record.startedAt,
+      finishedAt: record.finishedAt ?? null,
+      status: record.status,
+      capabilities: JSON.stringify(record.capabilities),
+      hostVersion: record.hostVersion ?? null,
+      pluginVersion: record.pluginVersion ?? null,
+      notes: record.notes ?? null,
+      createdAt,
+    };
+    this.db.prepare(`INSERT INTO probes
+      (id, owner_id, kind, started_at, finished_at, status, capabilities,
+       host_version, plugin_version, notes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      row.id, row.ownerId, row.kind, row.startedAt, row.finishedAt, row.status,
+      row.capabilities, row.hostVersion, row.pluginVersion, row.notes, row.createdAt,
+    );
+    return toProbe(this.db.prepare('SELECT * FROM probes WHERE id = ? AND owner_id = ?').get(row.id, this.ownerId));
+  }
+
+  latestProbe(kind) {
+    if (kind !== undefined && (typeof kind !== 'string' || kind.length === 0)) throw error('INVALID_ARGS', 'kind must be a non-empty string');
+    const row = this.db.prepare(`SELECT * FROM probes WHERE owner_id = ?
+      ${kind === undefined ? '' : 'AND kind = ?'}
+      ORDER BY started_at DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(...(kind === undefined ? [this.ownerId] : [this.ownerId, kind]));
+    return toProbe(row);
+  }
+
+  listProbes(args = {}) {
+    requireObject(args);
+    optionalString(args, 'kind');
+    if (args.kind !== undefined && args.kind.length === 0) throw error('INVALID_ARGS', 'kind must be a non-empty string');
+    const limit = args.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw error('INVALID_ARGS', 'limit must be an integer from 1 to 100');
+    }
+    return this.db.prepare(`SELECT * FROM probes WHERE owner_id = ?
+      ${args.kind === undefined ? '' : 'AND kind = ?'}
+      ORDER BY started_at DESC, created_at DESC, id DESC LIMIT ?`)
+      .all(...(args.kind === undefined ? [this.ownerId, limit] : [this.ownerId, args.kind, limit]))
+      .map(toProbe);
+  }
+
+  bindChannel(args = {}) {
+    requireObject(args);
+    requiredString(args, 'channel');
+    requiredString(args, 'appId');
+    requiredString(args, 'externalId');
+    optionalString(args, 'displayName');
+    const at = new Date().toISOString();
+    const id = randomUUID();
+    this.db.prepare(`INSERT INTO channel_bindings
+      (id, owner_id, channel, app_id, external_id, display_name, bound_at,
+       last_verified_at, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+      ON CONFLICT(owner_id, channel, app_id, external_id) DO UPDATE SET
+        display_name = excluded.display_name, updated_at = excluded.updated_at`).run(
+      id, this.ownerId, args.channel, args.appId, args.externalId, args.displayName ?? null,
+      at, at, at,
+    );
+    return toBinding(this.db.prepare(`SELECT * FROM channel_bindings
+      WHERE owner_id = ? AND channel = ? AND app_id = ? AND external_id = ?`)
+      .get(this.ownerId, args.channel, args.appId, args.externalId));
+  }
+
+  channelBindings() {
+    return this.db.prepare(`SELECT * FROM channel_bindings WHERE owner_id = ?
+      ORDER BY bound_at DESC, created_at DESC, id DESC`).all(this.ownerId).map(toBinding);
+  }
+
+  findChannelBinding({ channel, appId, externalId } = {}) {
+    return this.db.prepare(`SELECT * FROM channel_bindings
+      WHERE owner_id = ? AND channel = ? AND app_id = ?
+      ${externalId === undefined ? '' : 'AND external_id = ?'}
+      ORDER BY bound_at DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(...(externalId === undefined
+        ? [this.ownerId, channel, appId]
+        : [this.ownerId, channel, appId, externalId])) ?? null;
+  }
+
+  verifyBinding(id, at = new Date().toISOString()) {
+    requiredString({ id }, 'id');
+    requiredString({ at }, 'at');
+    this.db.prepare(`UPDATE channel_bindings SET last_verified_at = ?, last_error = NULL,
+      updated_at = ? WHERE id = ? AND owner_id = ?`).run(at, at, id, this.ownerId);
+    return toBinding(this.db.prepare('SELECT * FROM channel_bindings WHERE id = ? AND owner_id = ?').get(id, this.ownerId));
   }
 }
