@@ -26,7 +26,7 @@ function loadPlugin(t, options = {}) {
   return { registry, getCleanup: () => cleanup };
 }
 
-test('plugin exports contract and registers all sixteen tools', (t) => {
+test('plugin exports contract and registers all seventeen tools', (t) => {
   const { registry, getCleanup } = loadPlugin(t);
   assert.equal(plugin.name, 'nightdesk');
   assert.deepEqual(plugin.inject, ['tools']);
@@ -35,14 +35,18 @@ test('plugin exports contract and registers all sixteen tools', (t) => {
     'nightdesk_health', 'nightdesk_capture', 'nightdesk_items', 'nightdesk_confirm', 'nightdesk_complete',
     'nightdesk_remind', 'nightdesk_reminders', 'nightdesk_tick', 'nightdesk_channel',
     'nightdesk_probe_qq', 'nightdesk_probes', 'nightdesk_channels', 'nightdesk_bind_channel',
-    'nightdesk_session_watch', 'nightdesk_session_unwatch', 'nightdesk_sessions',
+    'nightdesk_session_watch', 'nightdesk_session_unwatch', 'nightdesk_sessions', 'nightdesk_overview',
   ]);
   for (const definition of registry.values()) {
     assert.equal(definition.parameters.type, 'object');
     assert.equal(definition.output.schema.type, 'object');
     assert.equal(typeof definition.description, 'string');
     assert.match(definition.description, /[一-鿿]/);
-    assert.deepEqual(definition.output.render({}, { ok: true }), [{ type: 'text', text: JSON.stringify({ ok: true }, null, 2) }]);
+    if (definition.name === 'nightdesk_overview') {
+      assert.equal(definition.output.render({}, { ok: true }).length, 2);
+    } else {
+      assert.deepEqual(definition.output.render({}, { ok: true }), [{ type: 'text', text: JSON.stringify({ ok: true }, null, 2) }]);
+    }
   }
   assert.equal(typeof getCleanup(), 'function');
 });

@@ -1,6 +1,7 @@
 import { createChannel, channelHealth, loadChannelConfig } from './channel.js';
 import { consumeOutbox } from './outbox.js';
 import { createQqProbe } from './probe.js';
+import { createOverview } from './overview.js';
 import { createSessionProbe } from './sessions-probe.js';
 import { createScheduler } from './scheduler.js';
 import { NightDeskStore } from './store.js';
@@ -48,6 +49,12 @@ export function apply(ctx, deps = {}) {
       now: deps.now,
       store,
     });
+    const overview = createOverview({
+      store,
+      sessionProbe,
+      now: deps.now,
+      config: channelConfig,
+    });
     scheduler = createScheduler({ store, channel });
     store.onItemChanged = (item, dueAt, kind) => applyItemChange(scheduler, {
       ...item,
@@ -74,6 +81,7 @@ export function apply(ctx, deps = {}) {
       channel,
       probe,
       sessionProbe,
+      overview,
       channelConfig: channelHealth(channelConfig),
     })) {
       ctx.tools.register(tool);

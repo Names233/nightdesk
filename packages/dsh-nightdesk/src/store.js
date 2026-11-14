@@ -557,6 +557,14 @@ export class NightDeskStore {
     return this.db.prepare('SELECT * FROM items WHERE id = ? AND owner_id = ?').get(itemId, this.ownerId);
   }
 
+  listItemsForOverview(args = {}) {
+    requireObject(args);
+    const ownerId = args.ownerId ?? this.ownerId;
+    requiredString({ ownerId }, 'ownerId');
+    return this.db.prepare(`SELECT * FROM items WHERE owner_id = ?
+      ORDER BY updated_at, id`).all(ownerId).map(toItem);
+  }
+
   confirm(args) {
     requireObject(args);
     requiredString(args, 'itemId');

@@ -1,15 +1,13 @@
 const objectSchema = { type: 'object', properties: {}, additionalProperties: true };
 
-function definition(name, description, properties, required, execute) {
+function definition(name, description, properties, required, execute, render = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]) {
   return {
     name,
     description,
     parameters: { type: 'object', properties, required },
     output: {
       schema: objectSchema,
-      render(args, value) {
-        return [{ type: 'text', text: JSON.stringify(value, null, 2) }];
-      },
+      render,
     },
     execute: async (args, exec) => execute(args ?? {}, exec),
   };
@@ -31,7 +29,7 @@ function publicBinding(record) {
   return { ...rest, openid: externalId };
 }
 
-export function createTools(store, { scheduler, channel, probe, sessionProbe, channelConfig } = {}) {
+export function createTools(store, { scheduler, channel, probe, sessionProbe, overview, channelConfig } = {}) {
   return [
     definition(
       'nightdesk_health',
@@ -199,5 +197,23 @@ export function createTools(store, { scheduler, channel, probe, sessionProbe, ch
         return { available: true, sessions, count: sessions.length };
       },
     ),
+    definition(
+      'nightdesk_overview',
+      '只读汇总今日事项、待决事项、最近完成、来源健康和会话快照；不会控制宿主会话或外部通道。',
+      {
+        refreshSessions: { type: 'boolean', default: false },
+      }, [], (args) => {
+        requireObjectArgs(args);
+        requireBoolean(args, 'refreshSessions');
+        if (!overview || typeof overview.build !== 'function') {
+          return { available: false, reason: 'overview-unavailable' };
+        }
+        return overview.build({ ownerId: store.ownerId, refreshSessions: args.refreshSessions ?? false });
+      }, (_args, value) => [
+        { type: 'text', text: JSON.stringify(value, null, 2) },
+        { type: 'text', text: value?.today && value?.pending && value?.health
+          ? (overview?.summary?.(value) ?? '汇总摘要不可用')
+          : '汇总摘要不可用' },
+      ]),
   ];
 }
