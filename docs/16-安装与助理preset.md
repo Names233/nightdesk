@@ -6,22 +6,25 @@
 
 | 项 | 值 | 说明 |
 | --- | --- | --- |
-| dsh | `0.2.2-rc.3` | 与桌面版 DSH Desktop 使用同一个 npm 包，但**独立 profile**，互不影响 |
+| dsh | `0.2.2-rc.3` | 与桌面版 DSH Desktop 使用同一个 npm 包 |
 | Node | `>= 24.9`（实测 v24.19.0） | 存储用 `node:sqlite`，必须是 Node 24 内置版本 |
-| profile | `C:\Users\Names\.dsh\profiles\nightdesk\` | 从 `web` 模板复制，端口默认 `5593` |
-| 数据目录 | `C:\Users\Names\.dsh\nightdesk-data\nightdesk.db` | SQLite WAL，插件启动时自动建库并迁移 |
+| **独立 HOME** | `C:\Users\Names\.dsh-nightdesk\` | **环境隔离的关键**，见下面说明 |
+| profile | `C:\Users\Names\.dsh-nightdesk\profiles\nightdesk\` | 从 `web` 模板复制，端口默认 `5593` |
+| 数据目录 | `C:\Users\Names\.dsh-nightdesk\nightdesk-data\nightdesk.db` | SQLite WAL，插件启动时自动建库并迁移 |
 | 插件 | `E:\Agents Dev\nightdesk\packages\dsh-nightdesk\src\index.js` | 零第三方依赖，纯 ESM |
 
-桌面版固定占用它自己的端口与 profile；NightDesk 用 `nightdesk` profile，两者可以同时开。
+**隔离口径（2026-11-15 修正）**：只换 profile 是不够的。dsh 的会话存在 `$DSH_HOME\sessions\<工作目录>` 下、按工作目录归档，工作区清单和附件也在 `$DSH_HOME` 里，**跨 profile 共享**。所以 NightDesk 必须用独立的 `DSH_HOME`，否则会在 5593 里看到桌面版的全部会话与工作区。现在的部署是：独立 HOME + 独立 profile + 独立插件数据目录；桌面版仍在 `C:\Users\Names\.dsh` 与自己端口上，两边互不可见。
 
 ## 2. 启动
 
 ```powershell
-# 首次：确认插件路径已写进 profile 的 cordis.patch.yml（见第 4 节）
+# 两个环境变量必须一起设，缺一个都会落回共享 HOME
+$env:DSH_HOME = 'C:\Users\Names\.dsh-nightdesk'
+$env:NIGHTDESK_DATA_DIR = 'C:\Users\Names\.dsh-nightdesk\nightdesk-data'
 npx -y @deepseek-ai/dsh@0.2.2-rc.3 nightdesk --port 5593 --no-open
 ```
 
-启动后终端会打印带 token 的地址（`http://127.0.0.1:5593/?token=...`），用浏览器打开即可对话。
+启动后终端会打印带 token 的地址（`http://127.0.0.1:5593/?token=...`），用浏览器打开即可对话。第一次打开是**空的会话列表和空的工作区清单**，这是隔离生效的表现，不是数据丢了。
 
 注意：
 
@@ -40,7 +43,7 @@ npx -y @deepseek-ai/dsh@0.2.2-rc.3 nightdesk --port 5593 --no-open
 
 preset 是 dsh 的「一个 Agent 用哪些子插件」声明。NightDesk 的助理 preset 只给对话、时间和 skill，不给 shell / 文件写入 / plan / goal，避免个人助理误操作本机文件。
 
-把下面这段追加到 `C:\Users\Names\.dsh\profiles\nightdesk\cordis.patch.yml` 末尾（与已有的 nightdesk 插件 `insert` 平级，属于同一个 YAML 列表）：
+把下面这段追加到 `C:\Users\Names\.dsh-nightdesk\profiles\nightdesk\cordis.patch.yml` 末尾（与已有的 nightdesk 插件 `insert` 平级，属于同一个 YAML 列表）：
 
 ```yaml
 - insert:
@@ -132,7 +135,7 @@ $env:NIGHTDESK_QQBOT_CLIENT_SECRET = '<机器人 AppSecret>'
 $env:NIGHTDESK_QQBOT_OPENID = '<你的 user_openid>'
 ```
 
-也可以写在 `C:\Users\Names\.dsh\nightdesk-data\channel.json`：
+也可以写在 `C:\Users\Names\.dsh-nightdesk\nightdesk-data\channel.json`：
 
 ```json
 { "kind": "qqbot", "appId": "...", "clientSecret": "...", "openid": "..." }
