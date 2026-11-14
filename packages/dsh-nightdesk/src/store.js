@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE, utcInstant } from './dates.js';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 const COMPLETIONS = new Set(['manual_complete', 'source_complete', 'conflicted']);
 const REMINDER_STATUSES = new Set(['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown']);
 
@@ -159,7 +159,7 @@ export class NightDeskStore {
     this.transaction(() => {
       if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()) {
         const version = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
-        if (version !== undefined && !['1', '2', '3', '4'].includes(version)) {
+        if (version !== undefined && !['1', '2', '3', '4', '5'].includes(version)) {
           throw error('INVALID_ARGS', `schema_version unsupported: ${version}`);
         }
       }
@@ -287,7 +287,63 @@ export class NightDeskStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS watched_sessions_unique
         ON watched_sessions(owner_id, session_id);
-      UPDATE meta SET value = '4' WHERE key = 'schema_version' AND value IN ('1', '2', '3', '4');
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        objective TEXT NOT NULL,
+        inputs_json TEXT NOT NULL,
+        allowed_tools_json TEXT NOT NULL,
+        scope TEXT,
+        completion_rule TEXT NOT NULL,
+        acceptance_json TEXT NOT NULL,
+        budget_json TEXT NOT NULL,
+        goal_version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_attempts (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL,
+        goal_version INTEGER NOT NULL,
+        input_version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        is_current INTEGER NOT NULL DEFAULT 1,
+        draft_text TEXT,
+        resources_json TEXT,
+        submitted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (task_id, attempt_no)
+      );
+      CREATE TABLE IF NOT EXISTS task_reviews (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        round INTEGER NOT NULL,
+        verdict TEXT NOT NULL,
+        structure_ok INTEGER NOT NULL,
+        evidence_ok INTEGER NOT NULL,
+        content_ok INTEGER NOT NULL,
+        findings_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_artifacts (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS task_attempts_current ON task_attempts(task_id, is_current);
+      UPDATE meta SET value = '5' WHERE key = 'schema_version' AND value IN ('1', '2', '3', '4', '5');
     `);
     const migrationAt = new Date().toISOString();
     const legacyItems = this.db.prepare(`SELECT i.* FROM items i

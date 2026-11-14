@@ -41,10 +41,10 @@ function findTool(tools, name) {
   return tool;
 }
 
-test('schema v4 creates watched_sessions and starts empty', () => {
+test('schema v5 creates watched_sessions and starts empty', () => {
   const fixture = makeStore();
   try {
-    assert.equal(fixture.store.health().schemaVersion, 4);
+    assert.equal(fixture.store.health().schemaVersion, 5);
     assert.deepEqual(fixture.store.listWatchedSessions({ ownerId: 'owner-test' }), []);
   } finally {
     fixture.close();

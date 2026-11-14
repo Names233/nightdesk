@@ -1,6 +1,6 @@
 # 安装与助理 preset
 
-本文说明怎么在本机跑起 NightDesk，以及「助理 preset」怎么接进 dsh。它只覆盖当前已实现的部分（D00 / D01 / D02 / D03 / D04 / D05 / D06 / D07）；D08 受管委派尚未实现。
+本文说明怎么在本机跑起 NightDesk，以及「助理 preset」怎么接进 dsh。它覆盖当前已实现的部分（D00 / D01 / D02 / D03 / D04 / D05 / D06 / D07 / D08）；D08 受管委派只做单 worker 本地草稿，真机与真实会话验证仍未做。
 
 ## 1. 运行前提
 
@@ -30,7 +30,7 @@ npx -y @deepseek-ai/dsh@0.2.2-rc.3 nightdesk --port 5593 --no-open
 
 ## 3. 数据与状态
 
-- 数据库迁移版本：`schema_version=4`（observations / items / item_versions / notifications / deliveries / outbox / outbox_event_handler / audit_events / idempotency / channel_bindings / probes / watched_sessions）。
+- 数据库迁移版本：`schema_version=5`（observations / items / item_versions / notifications / deliveries / outbox / outbox_event_handler / audit_events / idempotency / channel_bindings / probes / watched_sessions / tasks / task_attempts / task_reviews / task_artifacts）。
 - 所有时间字段按 RFC3339 UTC 保存；「今天」的判定用 `Asia/Shanghai` 日历。
 - 事项状态：`timeStatus ∈ resolved|unknown|ambiguous|conflicted|canceled`，`completion ∈ unconfirmed|manual_complete|source_complete|conflicted`。只有 `unconfirmed` 才能改期重排提醒。
 - 提醒状态机：`queued → submitting → accepted | failed`，可重试档位 10s / 30s / 120s / 120s，最多 5 次；进程重启时把遗留的 `submitting` 改成 `unknown` 并写审计，不自动重发（宁缺不重发）。
@@ -93,7 +93,7 @@ preset 是 dsh 的「一个 Agent 用哪些子插件」声明。NightDesk 的助
 
 `nightdesk` 业务插件本身仍由 profile 顶层的 `insert` 全局加载，所以提醒调度在任意会话里都在跑；preset 只决定助理会话能看见哪些工具。
 
-## 5. 工具清单（17 个）
+## 5. 工具清单（23 个）
 
 | 工具 | 用途 |
 | --- | --- |
@@ -114,6 +114,12 @@ preset 是 dsh 的「一个 Agent 用哪些子插件」声明。NightDesk 的助
 | `nightdesk_session_unwatch` | 移出观察名单 |
 | `nightdesk_sessions` | 观察名单与最近一次读取结果（可先 refresh） |
 | `nightdesk_overview` | 四段工作汇总（今日 / 待决 / 最近完成 / 来源健康）+ 中文摘要 |
+| `nightdesk_task_create` | 创建单 worker 受管任务（目标、验收、允许工具、预算、目标版本） |
+| `nightdesk_task_start` | 为任务启动本地草稿 attempt（幂等） |
+| `nightdesk_task_submit` | 按目标与任务版本提交当前 attempt 的草稿，写入不可变 artifact |
+| `nightdesk_task_review` | 核对结构 / 证据 / 内容；pass 或 needs_revision |
+| `nightdesk_task_stop` | 停止任务与当前 attempt（幂等） |
+| `nightdesk_tasks` | 查询任务与当前 attempt 摘要（不含草稿正文） |
 
 ## 6. QQ 通道怎么配
 
@@ -139,5 +145,5 @@ $env:NIGHTDESK_QQBOT_OPENID = '<你的 user_openid>'
 - **主动推送**：QQ 官方对主动消息有频控和每日额度，用户也可以关掉「允许主动发送」；探针只能证明「服务端受理」。
 - **微信**：v0.2 不做，缺官方主动推送承诺；需要时走独立探针，不复用 QQ 结论。
 - **会话运行状态**：宿主只读面没有运行态字段，`runState` 恒为 `unknown`。
-- **受管委派（D08）**：未实现，`docs/05` 的 L2/L3 能力目前只是设计。
+- **受管委派（D08）**：已实现单 worker 本地草稿、结构化核对、两轮返工、停止与旧 attempt 拒绝；不真的起子进程或子会话，不做多 worker、远程执行，也不写宿主 dsh 数据库。真机与真实会话验证仍未做。
 - **提醒的时效**：调度器在 dsh 进程里跑，进程不在就不发；重启后只在下次 tick 补发未过期的 `queued/retry`，`submitting` 会保守地记为 `unknown`。

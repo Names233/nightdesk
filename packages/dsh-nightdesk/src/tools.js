@@ -23,13 +23,27 @@ function requireBoolean(args, field) {
   }
 }
 
+function delegationDefinition(name, description, properties, required, execute, getDelegation) {
+  return definition(name, description, properties, required, async (args) => {
+    try {
+      if (!getDelegation()) throw new Error('INVALID_ARGS delegation is unavailable');
+      return await execute(args ?? {});
+    } catch (cause) {
+      const code = cause?.code ?? String(cause?.message ?? 'INVALID_ARGS').split(/\s+/, 1)[0];
+      const message = String(cause?.message ?? 'delegation failed').replace(new RegExp(`^${code}\\s*`), '');
+      return { ok: false, code, message };
+    }
+  });
+}
+
 function publicBinding(record) {
   if (!record) return null;
   const { externalId, ...rest } = record;
   return { ...rest, openid: externalId };
 }
 
-export function createTools(store, { scheduler, channel, probe, sessionProbe, overview, channelConfig } = {}) {
+export function createTools(store, { scheduler, channel, probe, sessionProbe, overview, channelConfig, delegation } = {}) {
+  const getDelegation = () => delegation;
   return [
     definition(
       'nightdesk_health',
@@ -215,5 +229,71 @@ export function createTools(store, { scheduler, channel, probe, sessionProbe, ov
           ? (overview?.summary?.(value) ?? '汇总摘要不可用')
           : '汇总摘要不可用' },
       ]),
+    delegationDefinition(
+      'nightdesk_task_create',
+      '为一个 worker 创建受管任务；只允许已注册工具，拒绝委派类工具与递归委派。',
+      {
+        objective: { type: 'string', minLength: 1, maxLength: 2000 },
+        acceptance: { type: 'array', minItems: 1 },
+        inputs: { type: 'array', items: { type: 'object' } },
+        allowedTools: { type: 'array', items: { type: 'string' } },
+        scope: { type: 'string' },
+        completionRule: { type: 'string', minLength: 1 },
+        budget: { type: 'object' },
+        goalVersion: { type: 'integer', minimum: 1, default: 1 },
+      }, ['objective', 'acceptance'], (args) => getDelegation().createTask({ ...args, ownerId: store.ownerId }), getDelegation,
+    ),
+    delegationDefinition(
+      'nightdesk_task_start',
+      '为任务启动一个本地草稿 attempt；同一任务已有进行中的 attempt 时幂等返回。',
+      {
+        taskId: { type: 'string', minLength: 1 },
+        goalVersion: { type: 'integer', minimum: 1 },
+      }, ['taskId'], (args) => getDelegation().startAttempt({ ...args, ownerId: store.ownerId }), getDelegation,
+    ),
+    delegationDefinition(
+      'nightdesk_task_submit',
+      '按目标版本与任务版本提交当前 attempt 的本地草稿，写入不可变 artifact。',
+      {
+        taskId: { type: 'string', minLength: 1 },
+        attemptId: { type: 'string', minLength: 1 },
+        draftText: { type: 'string', minLength: 1 },
+        expectedTaskVersion: { type: 'integer', minimum: 1 },
+        goalVersion: { type: 'integer', minimum: 1 },
+        resources: { type: 'object' },
+      }, ['taskId', 'attemptId', 'draftText', 'expectedTaskVersion'], (args) => getDelegation().submitDraft({ ...args, ownerId: store.ownerId }), getDelegation,
+    ),
+    delegationDefinition(
+      'nightdesk_task_review',
+      '核对当前已提交 attempt 的结构、证据与内容；pass 需三层全真，needs_revision 需至少一条 finding。',
+      {
+        taskId: { type: 'string', minLength: 1 },
+        attemptId: { type: 'string', minLength: 1 },
+        verdict: { type: 'string', enum: ['pass', 'needs_revision'] },
+        structure: { type: 'object' },
+        evidence: { type: 'object' },
+        content: { type: 'object' },
+        findings: { type: 'array', items: { type: 'object' } },
+      }, ['taskId', 'attemptId', 'verdict', 'structure', 'evidence', 'content'], (args) => getDelegation().review({ ...args, ownerId: store.ownerId }), getDelegation,
+    ),
+    delegationDefinition(
+      'nightdesk_task_stop',
+      '停止任务与当前 attempt；停止后拒绝新的启动与提交。',
+      {
+        taskId: { type: 'string', minLength: 1 },
+        reason: { type: 'string' },
+      }, ['taskId'], (args) => getDelegation().stop({ ...args, ownerId: store.ownerId }), getDelegation,
+    ),
+    delegationDefinition(
+      'nightdesk_tasks',
+      '列出受管任务及当前 attempt 摘要；不返回草稿正文。',
+      {
+        status: { type: 'string', enum: ['drafting', 'submitted', 'needs_revision', 'accepted', 'exhausted', 'stopped', 'canceled'] },
+      }, [], (args) => {
+        requireObjectArgs(args);
+        const tasks = getDelegation().list({ ...args, ownerId: store.ownerId });
+        return { tasks, count: tasks.length };
+      }, getDelegation,
+    ),
   ];
 }

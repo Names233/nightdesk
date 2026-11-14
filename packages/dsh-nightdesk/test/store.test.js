@@ -95,7 +95,7 @@ test('WAL and committed records survive reopening the database', (t) => {
   t.after(() => reopened.close());
   assert.equal(reopened.ownedItem(item.itemId).confirmed, 1);
   assert.equal(reopened.db.prepare('SELECT COUNT(*) AS count FROM outbox').get().count, 1);
-  assert.equal(reopened.health().schemaVersion, 4);
+  assert.equal(reopened.health().schemaVersion, 5);
 });
 
 test('confirm and remind reject date-only values without a timezone', (t) => {

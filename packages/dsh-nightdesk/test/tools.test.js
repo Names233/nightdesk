@@ -26,7 +26,7 @@ function loadPlugin(t, options = {}) {
   return { registry, getCleanup: () => cleanup };
 }
 
-test('plugin exports contract and registers all seventeen tools', (t) => {
+test('plugin exports contract and registers all twenty-three tools', (t) => {
   const { registry, getCleanup } = loadPlugin(t);
   assert.equal(plugin.name, 'nightdesk');
   assert.deepEqual(plugin.inject, ['tools']);
@@ -36,7 +36,14 @@ test('plugin exports contract and registers all seventeen tools', (t) => {
     'nightdesk_remind', 'nightdesk_reminders', 'nightdesk_tick', 'nightdesk_channel',
     'nightdesk_probe_qq', 'nightdesk_probes', 'nightdesk_channels', 'nightdesk_bind_channel',
     'nightdesk_session_watch', 'nightdesk_session_unwatch', 'nightdesk_sessions', 'nightdesk_overview',
+    'nightdesk_task_create', 'nightdesk_task_start', 'nightdesk_task_submit', 'nightdesk_task_review',
+    'nightdesk_task_stop', 'nightdesk_tasks',
   ]);
+  assert.equal(registry.size, 23);
+  for (const name of [
+    'nightdesk_task_create', 'nightdesk_task_start', 'nightdesk_task_submit',
+    'nightdesk_task_review', 'nightdesk_task_stop', 'nightdesk_tasks',
+  ]) assert.equal(registry.has(name), true, name);
   for (const definition of registry.values()) {
     assert.equal(definition.parameters.type, 'object');
     assert.equal(definition.output.schema.type, 'object');
@@ -56,7 +63,7 @@ test('health and capture return lossless JSON values without auto-confirming', a
   const health = await registry.get('nightdesk_health').execute({}, {});
   assert.equal(health.ok, true);
   assert.equal(health.pluginVersion, '0.1.0');
-  assert.equal(health.schemaVersion, 4);
+  assert.equal(health.schemaVersion, 5);
   assert.equal(health.timeZone, 'Asia/Shanghai');
   assert.equal(health.readOnly, false);
   assert.match(health.nowUtc, /Z$/);

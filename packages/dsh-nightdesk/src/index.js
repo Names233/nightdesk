@@ -1,4 +1,5 @@
 import { createChannel, channelHealth, loadChannelConfig } from './channel.js';
+import { createDelegation } from './delegation.js';
 import { consumeOutbox } from './outbox.js';
 import { createQqProbe } from './probe.js';
 import { createOverview } from './overview.js';
@@ -76,14 +77,17 @@ export function apply(ctx, deps = {}) {
     };
     outboxTimer = setInterval(() => { void consume(); }, 30_000);
     scheduler.start();
-    for (const tool of createTools(store, {
+    const toolOptions = {
       scheduler,
       channel,
       probe,
       sessionProbe,
       overview,
       channelConfig: channelHealth(channelConfig),
-    })) {
+    };
+    const knownTools = createTools(store, toolOptions).map(({ name }) => name);
+    const delegation = createDelegation({ store, now: deps.now, config: { knownTools } });
+    for (const tool of createTools(store, { ...toolOptions, delegation })) {
       ctx.tools.register(tool);
     }
     ctx.effect(() => async () => {

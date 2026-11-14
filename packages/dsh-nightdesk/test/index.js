@@ -8,3 +8,4 @@ import './outbox.test.js';
 import './probe.test.js';
 import './sessions-probe.test.js';
 import './overview.test.js';
+import './delegation.test.js';
