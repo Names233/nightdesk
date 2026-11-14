@@ -3,10 +3,11 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE } from './dates.js';
+import { extractDeadline, isShanghaiDate, shanghaiDate, TIME_ZONE, utcInstant } from './dates.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 const COMPLETIONS = new Set(['manual_complete', 'source_complete', 'conflicted']);
+const REMINDER_STATUSES = new Set(['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown']);
 
 function error(code, message) {
   return new Error(`${code} ${message}`);
@@ -85,11 +86,27 @@ export class NightDeskStore {
     mkdirSync(this.dataDir, { recursive: true });
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (cause) {
+      this.close();
+      throw cause;
+    }
   }
 
   migrate() {
-    this.db.exec(`
+    this.transaction(() => {
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get()) {
+        const version = this.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value;
+        if (version !== undefined && !['1', '2'].includes(version)) {
+          throw error('INVALID_ARGS', `schema_version unsupported: ${version}`);
+        }
+      }
+      // Version 1 used this name for an index, not a consumer cursor table.
+      if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'outbox_event_handler'").get()) {
+        this.db.exec('DROP INDEX outbox_event_handler');
+      }
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -141,7 +158,7 @@ export class NightDeskStore {
         available_at TEXT,
         created_at TEXT
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_handler
+      CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_dedupe
         ON outbox(event_id, handler_id);
       CREATE TABLE IF NOT EXISTS audit_events (
         id TEXT PRIMARY KEY,
@@ -158,11 +175,50 @@ export class NightDeskStore {
         response_json TEXT,
         created_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, item_id TEXT NOT NULL,
+        item_version INTEGER NOT NULL, kind TEXT NOT NULL,
+        due_at TEXT NOT NULL, scheduled_at TEXT NOT NULL,
+        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT, accepted_at TEXT, delivered_at TEXT,
+        canceled_at TEXT, cancel_reason TEXT, channel TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS notifications_unique
+        ON notifications(owner_id, item_id, item_version, kind);
+      CREATE INDEX IF NOT EXISTS notifications_due
+        ON notifications(status, next_attempt_at, scheduled_at);
+      CREATE TABLE IF NOT EXISTS deliveries (
+        id TEXT PRIMARY KEY, notification_id TEXT NOT NULL, attempt INTEGER NOT NULL,
+        channel TEXT NOT NULL, status TEXT NOT NULL, http_status INTEGER,
+        channel_message_id TEXT, error_detail TEXT, started_at TEXT NOT NULL, finished_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS deliveries_notification_attempt
+        ON deliveries(notification_id, attempt);
+      CREATE TABLE IF NOT EXISTS outbox_event_handler (
+        event_id TEXT NOT NULL, handler_id TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        PRIMARY KEY(event_id, handler_id)
+      );
+      UPDATE meta SET value = '2' WHERE key = 'schema_version' AND value IN ('1', '2');
     `);
+    const migrationAt = new Date().toISOString();
+    const legacyItems = this.db.prepare(`SELECT i.* FROM items i
+      WHERE i.owner_id IS NOT NULL AND i.confirmed = 1 AND i.completion = 'unconfirmed'
+        AND i.time_status NOT IN ('canceled', 'unknown', 'ambiguous') AND i.due_at IS NOT NULL`).all();
+    const backfill = this.db.prepare(`INSERT OR IGNORE INTO notifications
+      (id, owner_id, item_id, item_version, kind, due_at, scheduled_at, status,
+       attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'due', ?, ?, 'queued', 0, ?, ?, ?)`);
+    for (const item of legacyItems) {
+      backfill.run(randomUUID(), item.owner_id, item.id, item.version, item.due_at,
+        item.due_at, item.due_at, migrationAt, migrationAt);
+    }
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     if (Number(row.value) !== SCHEMA_VERSION) {
       throw error('INVALID_ARGS', `schema_version unsupported: ${row.value}`);
     }
+    });
   }
 
   close() {
@@ -348,6 +404,68 @@ export class NightDeskStore {
     };
   }
 
+  reminders(args = {}) {
+    requireObject(args);
+    optionalString(args, 'status');
+    const status = args.status ?? null;
+    const limit = args.limit ?? 50;
+    if (status !== null && !REMINDER_STATUSES.has(status)) {
+      throw error('INVALID_ARGS', 'status is not a supported notification state');
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw error('INVALID_ARGS', 'limit must be an integer from 1 to 100');
+    }
+    const notifications = this.db.prepare(`SELECT * FROM notifications WHERE owner_id = ?
+      ${status === null ? '' : 'AND status = ?'}
+      ORDER BY scheduled_at, created_at, id LIMIT ?`)
+      .all(...(status === null ? [this.ownerId, limit] : [this.ownerId, status, limit]));
+    return {
+      notifications: notifications.map((row) => ({
+        id: row.id,
+        itemId: row.item_id,
+        itemVersion: row.item_version,
+        kind: row.kind,
+        dueAt: row.due_at,
+        scheduledAt: row.scheduled_at,
+        nextAttemptAt: row.next_attempt_at,
+        status: row.status,
+        attempts: row.attempts,
+        acceptedAt: row.accepted_at,
+        deliveredAt: row.delivered_at,
+        canceledAt: row.canceled_at,
+        cancelReason: row.cancel_reason,
+        channel: row.channel,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      })),
+      count: notifications.length,
+    };
+  }
+
+  remind(args = {}) {
+    requireObject(args);
+    requiredString(args, 'itemId');
+    optionalString(args, 'kind');
+    if (args.dueAt !== undefined) utcInstant(args.dueAt);
+    if (args.kind !== undefined && args.kind.length === 0) throw error('INVALID_ARGS', 'kind must be non-empty');
+    if (typeof this.onReminderRequested !== 'function') throw error('INVALID_ARGS', 'scheduler is unavailable');
+    return this.transaction(() => {
+      const item = this.ownedItem(args.itemId);
+      if (!item) throw error('INVALID_ARGS', 'itemId not found');
+      if (!item.confirmed || item.completion !== 'unconfirmed' || item.time_status === 'canceled') {
+        throw error('INVALID_ARGS', 'item must be confirmed, uncompleted and not canceled');
+      }
+      const dueAt = args.dueAt ?? item.due_at;
+      if (dueAt === null) throw error('INVALID_ARGS', 'dueAt is required when the item has no instant deadline');
+      return this.onReminderRequested(item, utcInstant(dueAt), args.kind ?? 'due');
+    });
+  }
+
+  recordAudit(action, itemId, at, detail = {}) {
+    this.db.prepare('INSERT INTO audit_events(id, at, actor, action, item_id, detail_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), at, this.ownerId, action, itemId, JSON.stringify(detail));
+  }
+
   ownedItem(itemId) {
     return this.db.prepare('SELECT * FROM items WHERE id = ? AND owner_id = ?').get(itemId, this.ownerId);
   }
@@ -364,16 +482,14 @@ export class NightDeskStore {
       || shanghaiDate(`${args.dueDate}T00:00:00+08:00`) !== args.dueDate)) {
       throw error('INVALID_ARGS', 'dueDate must be a valid YYYY-MM-DD');
     }
-    if (args.dueAt !== undefined && Number.isNaN(new Date(args.dueAt).getTime())) {
-      throw error('INVALID_ARGS', 'dueAt must be RFC3339');
-    }
+    if (args.dueAt !== undefined) utcInstant(args.dueAt);
     if (args.title !== undefined && args.title.length === 0) throw error('INVALID_ARGS', 'title must be non-empty');
     const current = this.ownedItem(args.itemId);
     if (!current || current.version !== args.expectedVersion) {
       throw error('VERSION_CONFLICT', `itemId ${args.itemId}; currentVersion ${current?.version ?? 'not-found'}`);
     }
     const at = new Date().toISOString();
-    const dueAt = args.dueAt === undefined ? current.due_at : new Date(args.dueAt).toISOString();
+    const dueAt = args.dueAt === undefined ? current.due_at : utcInstant(args.dueAt);
     const dueDate = args.dueDate ?? (args.dueAt !== undefined ? shanghaiDate(dueAt) : current.due_date);
     const timeStatus = args.timeStatus ?? current.time_status;
     const precision = args.dueAt !== undefined ? 'instant' : args.dueDate !== undefined ? 'day' : current.precision;
@@ -388,6 +504,7 @@ export class NightDeskStore {
       const updated = this.ownedItem(args.itemId);
       this.appendVersion(updated, at, 'confirm');
       this.recordEvent('nightdesk.confirm', 'item.confirmed', updated, at);
+      this.onItemChanged?.(updated, updated.due_at, 'due');
       return toItem(updated);
     });
   }
@@ -414,6 +531,7 @@ export class NightDeskStore {
       const updated = this.ownedItem(args.itemId);
       this.appendVersion(updated, at, 'complete');
       this.recordEvent('nightdesk.complete', 'item.completed', updated, at);
+      this.onItemChanged?.(updated, null, 'due');
       return toItem(updated);
     });
   }

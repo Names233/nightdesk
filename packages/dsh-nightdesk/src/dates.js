@@ -1,5 +1,16 @@
 export const TIME_ZONE = 'Asia/Shanghai';
 
+export function utcInstant(value, field = 'dueAt') {
+  if (typeof value !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    || Number.isNaN(Date.parse(value))) {
+    throw new Error(`INVALID_ARGS ${field} must be RFC3339`);
+  }
+  const [year, month, day] = value.slice(0, 10).split('-').map(Number);
+  if (!validDate(year, month, day)) throw new Error(`INVALID_ARGS ${field} must be RFC3339`);
+  return new Date(value).toISOString();
+}
+
 const calendarFormatter = new Intl.DateTimeFormat('en-US', {
   timeZone: TIME_ZONE,
   year: 'numeric',

@@ -15,7 +15,7 @@ function definition(name, description, properties, required, execute) {
   };
 }
 
-export function createTools(store) {
+export function createTools(store, { scheduler, channel, channelConfig } = {}) {
   return [
     definition(
       'nightdesk_health',
@@ -62,6 +62,36 @@ export function createTools(store) {
         expectedVersion: { type: 'integer', minimum: 1 },
         completion: { type: 'string', enum: ['manual_complete', 'source_complete', 'conflicted'], default: 'manual_complete' },
       }, ['itemId', 'expectedVersion'], (args) => store.complete(args),
+    ),
+    definition(
+      'nightdesk_remind',
+      '为已确认且未完成的事项安排提醒；可按事项当前版本指定到期时刻与类型。',
+      {
+        itemId: { type: 'string', minLength: 1 },
+        dueAt: { type: 'string', format: 'date-time' },
+        kind: { type: 'string', minLength: 1, default: 'due' },
+      }, ['itemId'], (args) => store.remind(args),
+    ),
+    definition(
+      'nightdesk_reminders',
+      '查询提醒的调度、通道受理与设备确认状态，不把通道受理当作已送达。',
+      {
+        status: { type: 'string', enum: ['queued', 'retry', 'submitting', 'accepted', 'failed', 'canceled', 'unknown'] },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+      }, [], (args) => store.reminders(args),
+    ),
+    definition(
+      'nightdesk_tick',
+      '手动处理当前到期的提醒；不依赖模型，也不产生设备送达回执。',
+      {}, [], () => scheduler.tick(),
+    ),
+    definition(
+      'nightdesk_channel',
+      '查看所选提醒通道及必要配置是否齐全，不返回凭据或密钥。',
+      {}, [], () => ({
+        name: channel.name,
+        configured: channelConfig.configured,
+      }),
     ),
   ];
 }

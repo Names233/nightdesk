@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as plugin from '../src/index.js';
 
-function loadPlugin(t) {
+function loadPlugin(t, options = {}) {
   const registry = new Map();
   let cleanup;
   const ctx = {
@@ -15,22 +15,25 @@ function loadPlugin(t) {
   };
   process.env.NIGHTDESK_DATA_DIR = mkdtempSync(join(tmpdir(), 'nightdesk-tools-'));
   process.env.NIGHTDESK_OWNER = 'tools-test';
-  t.after(() => {
-    cleanup();
+  if (options.kind) process.env.NIGHTDESK_CHANNEL_KIND = options.kind;
+  t.after(async () => {
+    await cleanup();
     delete process.env.NIGHTDESK_DATA_DIR;
     delete process.env.NIGHTDESK_OWNER;
+    delete process.env.NIGHTDESK_CHANNEL_KIND;
   });
-  plugin.apply(ctx);
+  plugin.apply(ctx, options);
   return { registry, getCleanup: () => cleanup };
 }
 
-test('plugin exports contract and registers all five tools', (t) => {
+test('plugin exports contract and registers all nine tools', (t) => {
   const { registry, getCleanup } = loadPlugin(t);
   assert.equal(plugin.name, 'nightdesk');
   assert.deepEqual(plugin.inject, ['tools']);
   assert.equal(typeof plugin.apply, 'function');
   assert.deepEqual([...registry.keys()], [
     'nightdesk_health', 'nightdesk_capture', 'nightdesk_items', 'nightdesk_confirm', 'nightdesk_complete',
+    'nightdesk_remind', 'nightdesk_reminders', 'nightdesk_tick', 'nightdesk_channel',
   ]);
   for (const definition of registry.values()) {
     assert.equal(definition.parameters.type, 'object');
@@ -47,7 +50,7 @@ test('health and capture return lossless JSON values without auto-confirming', a
   const health = await registry.get('nightdesk_health').execute({}, {});
   assert.equal(health.ok, true);
   assert.equal(health.pluginVersion, '0.1.0');
-  assert.equal(health.schemaVersion, 1);
+  assert.equal(health.schemaVersion, 2);
   assert.equal(health.timeZone, 'Asia/Shanghai');
   assert.equal(health.readOnly, false);
   assert.match(health.nowUtc, /Z$/);
@@ -82,4 +85,64 @@ test('capture, confirm and query execute through the registered tools', async (t
   assert.equal(items.counts.returned, 1);
   const completed = await registry.get('nightdesk_complete').execute({ itemId: candidate.itemId, expectedVersion: 2 }, {});
   assert.equal(completed.completion, 'manual_complete');
+});
+
+test('reminder tools schedule, list, tick and hide channel credentials', async (t) => {
+  const { registry } = loadPlugin(t);
+  assert.deepEqual(await registry.get('nightdesk_channel').execute({}, {}), { name: 'console', configured: true });
+  const captured = await registry.get('nightdesk_capture').execute({ text: '明天交材料' }, {});
+  const item = captured.candidates[0];
+  await registry.get('nightdesk_confirm').execute({
+    itemId: item.itemId, expectedVersion: item.version, dueAt: '2026-11-20T00:00:00.000Z', timeStatus: 'resolved',
+  }, {});
+  const reminder = await registry.get('nightdesk_remind').execute({ itemId: item.itemId, dueAt: '2026-11-21T00:00:00.000Z', kind: 'followup' }, {});
+  assert.equal(reminder.kind, 'followup');
+  const listed = await registry.get('nightdesk_reminders').execute({ status: 'queued' }, {});
+  assert.equal(listed.count, 2);
+  assert.equal(listed.notifications.every((row) => row.deliveredAt === null), true);
+  const tick = await registry.get('nightdesk_tick').execute({}, {});
+  assert.deepEqual(tick, { processed: 0, accepted: 0, retry: 0, failed: 0 });
+});
+
+test('plugin teardown stops timers without starting a new delivery tick', async (t) => {
+  const oldSetInterval = globalThis.setInterval;
+  const oldClearInterval = globalThis.clearInterval;
+  const timers = [];
+  const cleared = [];
+  const logs = [];
+  globalThis.setInterval = (fn, ms) => {
+    const timer = { fn, ms };
+    timers.push(timer);
+    return timer;
+  };
+  globalThis.clearInterval = (timer) => cleared.push(timer);
+  const dataDir = mkdtempSync(join(tmpdir(), 'nightdesk-shutdown-'));
+  process.env.NIGHTDESK_DATA_DIR = dataDir;
+  process.env.NIGHTDESK_OWNER = 'shutdown-test';
+  const registry = new Map();
+  let cleanup;
+  try {
+    plugin.apply({
+      tools: { register: (definition) => registry.set(definition.name, definition) },
+      effect: (fn) => { cleanup = fn(); },
+      on: () => {},
+    }, { log: (text) => logs.push(text) });
+    globalThis.setInterval = oldSetInterval;
+    const captured = await registry.get('nightdesk_capture').execute({ text: '过期事项' }, {});
+    await registry.get('nightdesk_confirm').execute({
+      itemId: captured.candidates[0].itemId,
+      expectedVersion: 1,
+      dueAt: '2020-01-01T00:00:00.000Z',
+      timeStatus: 'resolved',
+    }, {});
+    await cleanup();
+  } finally {
+    globalThis.setInterval = oldSetInterval;
+    globalThis.clearInterval = oldClearInterval;
+    delete process.env.NIGHTDESK_DATA_DIR;
+    delete process.env.NIGHTDESK_OWNER;
+  }
+  assert.equal(timers.length, 2);
+  assert.deepEqual(cleared, timers);
+  assert.deepEqual(logs, []);
 });
